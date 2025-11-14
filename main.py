@@ -4,7 +4,8 @@ import os
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 import firebase_admin
-from firebase_admin import firestore, credentials
+from firebase_admin import firestore
+from google.auth.transport.requests import Request
 import logging
 
 app = FastAPI()
@@ -16,10 +17,9 @@ CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 PROJECT_ID = os.getenv("PROJECT_ID", "ingest-gmail-api")
 CLOUD_RUN_URL = os.getenv("CLOUD_RUN_URL", "http://localhost:8080")
 
-# Initialize Firebase
+# Initialize Firebase with explicit service account (fixes Cloud Run)
 if not firebase_admin._apps:
-    cred = credentials.ApplicationDefault()
-    firebase_admin.initialize_app(cred, {"projectId": PROJECT_ID})
+    firebase_admin.initialize_app()
 db = firestore.client()
 
 SCOPES = [
@@ -29,7 +29,6 @@ SCOPES = [
 
 REDIRECT_URI = f"{CLOUD_RUN_URL}/auth/callback"
 
-# === ROUTES ===
 @app.get("/", response_class=HTMLResponse)
 async def root():
     return """
@@ -39,6 +38,9 @@ async def root():
 
 @app.get("/install", response_class=HTMLResponse)
 async def install(request: Request):
+    if not CLIENT_ID or not CLIENT_SECRET:
+        raise HTTPException(500, "Missing CLIENT_ID or CLIENT_SECRET")
+    
     flow = Flow.from_client_config(
         {
             "web": {
@@ -52,15 +54,21 @@ async def install(request: Request):
         scopes=SCOPES
     )
     flow.redirect_uri = REDIRECT_URI
-    auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
+    auth_url, state = flow.authorization_url(prompt="consent", access_type="offline")
+    # Save state in memory (for demo)
+    request.app.state.oauth_state = state
     return f'<h2>Connect Gmail</h2><p><a href="{auth_url}">Click to Authorize</a></p>'
 
 @app.get("/auth/callback")
-async def callback(request: Request, code: str = None, error: str = None):
+async def callback(request: Request, code: str = None, state: str = None, error: str = None):
     if error:
         raise HTTPException(status_code=400, detail=error)
-    if not code:
-        raise HTTPException(status_code=400, detail="No code")
+    if not code or not state:
+        raise HTTPException(status_code=400, detail="Missing code or state")
+
+    # Validate state
+    if state != getattr(request.app, "state", {}).get("oauth_state"):
+        raise HTTPException(status_code=400, detail="Invalid state parameter")
 
     flow = Flow.from_client_config(
         {
@@ -75,28 +83,42 @@ async def callback(request: Request, code: str = None, error: str = None):
         scopes=SCOPES
     )
     flow.redirect_uri = REDIRECT_URI
-    flow.fetch_token(authorization_response=str(request.url))
+    try:
+        flow.fetch_token(authorization_response=str(request.url))
+    except Exception as e:
+        logging.error(f"Token fetch failed: {e}")
+        raise HTTPException(500, "Failed to get token")
 
     creds = flow.credentials
+    if creds.refresh_token:
+        creds.refresh(Request())
+
     # Get user email
-    service = build("oauth2", "v2", credentials=creds)
-    user_info = service.userinfo().get().execute()
-    email = user_info["email"]
+    try:
+        service = build("oauth2", "v2", credentials=creds)
+        user_info = service.userinfo().get().execute()
+        email = user_info["email"]
+    except Exception as e:
+        logging.error(f"User info failed: {e}")
+        raise HTTPException(500, "Failed to get user info")
 
     # Save to Firestore
-    db.collection("users").document(email).set({
-        "token": creds.token,
-        "refresh_token": creds.refresh_token,
-        "token_uri": creds.token_uri,
-        "client_id": creds.client_id,
-        "client_secret": creds.client_secret,
-        "scopes": creds.scopes,
-        "saved_at": firestore.SERVER_TIMESTAMP
-    }, merge=True)
-
-    # === Set up Gmail Watch ===
-    gmail = build("gmail", "v1", credentials=creds)
     try:
+        db.collection("users").document(email).set({
+            "token": creds.token,
+            "refresh_token": creds.refresh_token,
+            "token_uri": creds.token_uri,
+            "client_id": creds.client_id,
+            "client_secret": creds.client_secret,
+            "scopes": creds.scopes,
+            "saved_at": firestore.SERVER_TIMESTAMP
+        }, merge=True)
+    except Exception as e:
+        logging.error(f"Firestore save failed: {e}")
+
+    # Set up Gmail watch
+    try:
+        gmail = build("gmail", "v1", credentials=creds)
         gmail.users().watch(
             userId="me",
             body={
@@ -107,7 +129,7 @@ async def callback(request: Request, code: str = None, error: str = None):
         ).execute()
         logging.info(f"Watch set up for {email}")
     except Exception as e:
-        logging.warning(f"Watch failed (maybe already set): {e}")
+        logging.warning(f"Watch failed: {e}")
 
     return HTMLResponse(f"""
     <h2>Success!</h2>
