@@ -5,8 +5,8 @@ from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 import firebase_admin
 from firebase_admin import firestore
-from google.auth.transport.requests import Request
 import logging
+from typing import Dict
 
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
@@ -17,7 +17,10 @@ CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 PROJECT_ID = os.getenv("PROJECT_ID", "ingest-gmail-api")
 CLOUD_RUN_URL = os.getenv("CLOUD_RUN_URL", "http://localhost:8080")
 
-# Initialize Firebase with explicit service account (fixes Cloud Run)
+# Global state storage (in-memory, per instance)
+STATE_STORE: Dict[str, str] = {}
+
+# Initialize Firebase with default credentials
 if not firebase_admin._apps:
     firebase_admin.initialize_app()
 db = firestore.client()
@@ -39,8 +42,9 @@ async def root():
 @app.get("/install", response_class=HTMLResponse)
 async def install(request: Request):
     if not CLIENT_ID or not CLIENT_SECRET:
-        raise HTTPException(500, "Missing CLIENT_ID or CLIENT_SECRET")
-    
+        logging.error("Missing CLIENT_ID or CLIENT_SECRET")
+        raise HTTPException(500, "Server misconfigured")
+
     flow = Flow.from_client_config(
         {
             "web": {
@@ -55,20 +59,28 @@ async def install(request: Request):
     )
     flow.redirect_uri = REDIRECT_URI
     auth_url, state = flow.authorization_url(prompt="consent", access_type="offline")
-    # Save state in memory (for demo)
-    request.app.state.oauth_state = state
-    return f'<h2>Connect Gmail</h2><p><a href="{auth_url}">Click to Authorize</a></p>'
+    
+    # Store state with a random key
+    import uuid
+    state_key = str(uuid.uuid4())
+    STATE_STORE[state_key] = state
+    #Pass state_key as query param instead of appending to auth_url
+    return f'<h2>Connect Gmail</h2><p><a href="{auth_url}?my_state_key={state_key}">Click to Authorize</a></p>'
 
 @app.get("/auth/callback")
 async def callback(request: Request, code: str = None, state: str = None, error: str = None):
     if error:
-        raise HTTPException(status_code=400, detail=error)
+        logging.error(f"OAuth error: {error}")
+        raise HTTPException(400, f"OAuth error: {error}")
     if not code or not state:
-        raise HTTPException(status_code=400, detail="Missing code or state")
+        raise HTTPException(400, "Missing code or state")
 
-    # Validate state
-    if state != getattr(request.app, "state", {}).get("oauth_state"):
-        raise HTTPException(status_code=400, detail="Invalid state parameter")
+    # Get my_state_key from callback URL
+    my_state_key = request.query_params.get('my_state_key')
+    if not my_state_key or my_state_key not in STATE_STORE:
+        logging.error(f"Invalid or expired state: {my_state_key}")
+        raise HTTPException(400, "Invalid state")
+    expected_state = STATE_STORE.pop(my_state_key)  # Remove after use
 
     flow = Flow.from_client_config(
         {
@@ -83,6 +95,7 @@ async def callback(request: Request, code: str = None, state: str = None, error:
         scopes=SCOPES
     )
     flow.redirect_uri = REDIRECT_URI
+
     try:
         flow.fetch_token(authorization_response=str(request.url))
     except Exception as e:
@@ -90,8 +103,6 @@ async def callback(request: Request, code: str = None, state: str = None, error:
         raise HTTPException(500, "Failed to get token")
 
     creds = flow.credentials
-    if creds.refresh_token:
-        creds.refresh(Request())
 
     # Get user email
     try:
@@ -113,6 +124,7 @@ async def callback(request: Request, code: str = None, state: str = None, error:
             "scopes": creds.scopes,
             "saved_at": firestore.SERVER_TIMESTAMP
         }, merge=True)
+        logging.info(f"Tokens saved for {email}")
     except Exception as e:
         logging.error(f"Firestore save failed: {e}")
 
@@ -127,13 +139,14 @@ async def callback(request: Request, code: str = None, state: str = None, error:
                 "labelFilterBehavior": "INCLUDE"
             }
         ).execute()
-        logging.info(f"Watch set up for {email}")
+        logging.info(f"Gmail watch set for {email}")
     except Exception as e:
-        logging.warning(f"Watch failed: {e}")
+        logging.warning(f"Watch failed (may already exist): {e}")
 
     return HTMLResponse(f"""
-    <h2>Success!</h2>
+    <h2>SUCCESS!</h2>
     <p>Connected: <strong>{email}</strong></p>
-    <p>Tokens saved. Gmail watch active.</p>
+    <p>Tokens saved to Firestore.</p>
+    <p>Gmail push active.</p>
     <p>You can close this tab.</p>
     """)
