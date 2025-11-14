@@ -58,14 +58,12 @@ async def install(request: Request):
         scopes=SCOPES
     )
     flow.redirect_uri = REDIRECT_URI
-    auth_url, state = flow.authorization_url(prompt="consent", access_type="offline")
+        auth_url, state = flow.authorization_url(prompt="consent", access_type="offline")
     
-    # Store state with a random key
-    import uuid
-    state_key = str(uuid.uuid4())
-    STATE_STORE[state_key] = state
-    #Pass state_key as query param instead of appending to auth_url
-    return f'<h2>Connect Gmail</h2><p><a href="{auth_url}?my_state_key={state_key}">Click to Authorize</a></p>'
+        # Store the real state directly (no key, no extra param)
+        STATE_STORE[state] = state
+    
+    return f'<h2>Connect Gmail</h2><p><a href="{auth_url}">Click to Authorize</a></p>'
 
 @app.get("/auth/callback")
 async def callback(request: Request, code: str = None, state: str = None, error: str = None):
@@ -75,12 +73,11 @@ async def callback(request: Request, code: str = None, state: str = None, error:
     if not code or not state:
         raise HTTPException(400, "Missing code or state")
 
-    # Get my_state_key from callback URL
-    my_state_key = request.query_params.get('my_state_key')
-    if not my_state_key or my_state_key not in STATE_STORE:
-        logging.error(f"Invalid or expired state: {my_state_key}")
+# Validate state directly
+    if state not in STATE_STORE:
+        logging.error(f"Invalid or expired state: {state}")
         raise HTTPException(400, "Invalid state")
-    expected_state = STATE_STORE.pop(my_state_key)  # Remove after use
+    STATE_STORE.pop(state)  # Remove after use (no need to compare)
 
     flow = Flow.from_client_config(
         {
